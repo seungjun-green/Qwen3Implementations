@@ -1,0 +1,276 @@
+import numpy as np
+from dataclasses import dataclass
+
+@dataclass
+class Qwen3Config:
+    vocab_size: int = 151_936
+    D: int = 1024 # model dimension
+    d_h: int = 128 # size of W_{Q, K, V}
+    H_q: int = 16 # number of q in an attenion block
+    H_kv: int = 8 # number of {k, v} in an attention block
+    I: int = 3072
+    num_layers: int = 28
+    base: float = 1_000_000
+    eps: float = 1e-6
+
+
+class RMSNorm:
+    def __init__(self, gamma, eps):
+        self.gamma = gamma
+        self.eps = eps
+
+    def __call__(self, x):
+        '''
+        x.shape: (N, L, D)
+        self.gamma.shape: (D, )
+        '''
+        denominator = np.sqrt(np.mean(x **2, axis=-1, keepdims=True) + self.eps) # (N, L, 1)
+        return (x / denominator) * self.gamma # (N, L, D)
+
+
+class Rope:
+    def __init__(self, base):
+        self.base = base
+
+    def rotate_half(self, x):
+        half = x.shape[-1] // 2
+        x1 = x[..., :half]
+        x2 = x[..., half:]
+        return np.concatenate([-x2, x1], axis=-1)
+
+
+    def __call__(self, x, start=0):
+        # x shape: (N, H, L, d_h)
+        L, d_h = x.shape[-2], x.shape[-1]
+
+        inv_freq = self.base ** (-np.arange(0, d_h, 2) / d_h)        
+        freqs = np.outer(np.arange(start, start + L), inv_freq)                   
+        emb = np.concatenate([freqs, freqs], axis=-1)     
+
+        cos = np.cos(emb)
+        sin = np.sin(emb)
+
+        return x*cos + self.rotate_half(x)*sin
+
+    
+
+class Attention:
+    def __init__(self, WQ, WK, WV, WO, 
+                 dh, q_gamma, k_gamma, eps,
+                 base):
+        self.W_Q = WQ #((D, H_q * d_h) 
+        self.W_K = WK #(D, H_kv * d_h) 
+        self.W_V = WV #(D, H_kv * d_h) 
+        self.W_O = WO
+        self.d_h = dh
+        
+        self.q_rms_norm = RMSNorm(q_gamma, eps)
+        self.k_rms_norm = RMSNorm(k_gamma, eps)
+
+        self.rope = Rope(base)
+        self.reset_cache()
+
+    def reset_cache(self):
+        self.K_cache = None
+        self.V_cache = None
+
+    def softmax(self, x, axis=-1):
+        x = x - np.max(x, axis=-1, keepdims=True)
+        e = np.exp(x)
+        return e / np.sum(e, axis=-1, keepdims=True)
+
+    def __call__(self, x):
+        N, L_new, _ = x.shape
+        L_past = 0 if self.K_cache is None else self.K_cache.shape[2]
+
+        ## Step1. Get Q, K, V
+        Q = x @ self.W_Q # (N, L_new, Hq*d_h)
+        K = (x @ self.W_K) # (N, L_new, Hkv*d_h)
+        V = (x @ self.W_V) # (N, L_new, Hkv*d_h)
+
+        ## Step2  then split into heads
+        Q = Q.reshape(N, L_new, -1, self.d_h).transpose(0, 2, 1, 3) # (N, H_q, L_new, d_h)
+        K = K.reshape(N, L_new, -1, self.d_h).transpose(0, 2, 1, 3) # (N, H_kv, L_new, d_h)
+        V = V.reshape(N, L_new, -1, self.d_h).transpose(0, 2, 1, 3) # (N, H_kv, L_new, d_h)
+
+        ## Step3. RMSNorm
+        Q = self.q_rms_norm(Q)
+        K = self.k_rms_norm(K)
+
+        ## Step4 Apply RoPE
+        Q = self.rope(Q, start=L_past)
+        K = self.rope(K, start=L_past)
+
+        if self.K_cache is not None:
+            K = np.concatenate([self.K_cache, K], axis=2)
+            V = np.concatenate([self.V_cache, V], axis=2)
+        self.K_cache, self.V_cache = K, V
+
+        ## Step5: Calculate Attention
+        H_q = Q.shape[1]
+        group_size = Q.shape[1] // K.shape[1]
+        K = np.repeat(K, group_size, axis=1) # (N, H_q, L_total, d_h)
+        V = np.repeat(V, group_size, axis=1) # (N, H_q, L_total, d_h)
+
+        L_total = K.shape[2]
+        scores = Q @ K.transpose(0, 1, 3, 2) / np.sqrt(self.d_h) # (N, H_q, L_new, L_total)
+        mask = np.triu(np.ones((L_new, L_total), dtype=bool), k=1 + L_past) # (Lnew, Ltotal)
+        scores = np.where(mask, -np.inf, scores) # (N, H_q, L_new, L_total)
+
+
+        out = self.softmax(scores, axis=-1) @ V # (N, H_q, L_new, L_total) @ # (N, H_q, L_total, d_h) => (N, H_q, N_new, d_h)
+        out = out.transpose(0, 2, 1, 3).reshape(N, L_new, H_q * self.d_h) # (N, L_new, D)
+        out = out @ self.W_O # (N, L_new, D) @ (D, D) => (N, Lnew, D)
+
+        return out
+
+class FFN:
+    def __init__(self, Wgate, Wup, Wdown):
+        self.W_gate = Wgate
+        self.W_up = Wup
+        self.W_down = Wdown
+        pass
+
+    def silu(self, x):
+        return x / (1 + np.exp(-x))  
+
+    def __call__(self, x):
+        # x: (N, L, D)
+        # W_gate, W_up: (D, I)    I = intermediate size (3072 in Qwen3-0.6B)
+        # W_down: (I, D)
+        gate = self.silu(x @ self.W_gate) # (N, L, I)  how much of each feature to keep
+        up = x @ self.W_up # (N, L, I)  the expanded information
+        return (gate * up) @ self.W_down # (N, L, D)
+
+
+
+class Qwen3DecoderLayer:
+    def __init__(self, params):
+
+        gamma1, gamma2, eps, WQ, WK, WV, WO, dh, q_gamma, k_gamma, base, Wgate, Wup, Wdown = params
+        
+        self.rms_norm1 = RMSNorm(gamma1, eps)
+        self.masked_gqa_attention = Attention(WQ, WK, WV, WO, dh, q_gamma, k_gamma, eps, base)
+        self.rms_norm2 = RMSNorm(gamma2, eps)
+        self.ffn = FFN(Wgate, Wup, Wdown)
+
+    def __call__(self, x):
+        x_tilda = self.rms_norm1(x)
+        x_tilda = self.masked_gqa_attention(x_tilda)
+        x = x_tilda + x
+
+        x_tilda = self.rms_norm2(x)
+        x_tilda = self.ffn(x_tilda)
+        x = x_tilda + x
+
+        return x
+
+
+class Embedding:
+    def __init__(self, WE):
+        self.W_E = WE
+
+    def __call__(self, x):
+        return self.W_E[x]
+
+
+class FinalOutputLayer:
+    def __init__(self, output_matrix):
+        self.output_matrix = output_matrix
+
+    def __call__(self, x):
+        return x@self.output_matrix
+
+
+
+class Qwen3:
+    def __init__(self, num_layers, WE, gamma, eps, output_matrix, decoder_layer_parms):
+        self.num_layers = num_layers
+        self.embedding = Embedding(WE)
+        self.decoder_layers = [Qwen3DecoderLayer(decoder_layer_parms[i]) for i in range(num_layers)]
+        self.final_RMSNorm = RMSNorm(gamma, eps)
+        self.final_output_layer = FinalOutputLayer(output_matrix)
+
+    def __call__(self, x):
+        x = self.embedding(x)
+        for i in range(self.num_layers):
+            x = self.decoder_layers[i](x)
+        x = self.final_RMSNorm(x)
+        x = self.final_output_layer(x)
+        return x
+
+
+
+import numpy as np
+
+class RandomQwen3Weights:
+    def __init__(self, cfg, seed=0):
+        self.rng = np.random.default_rng(seed)
+        self.num_layers = cfg.num_layers
+        self.eps = cfg.eps
+        self.WE = self.rand(cfg.vocab_size, cfg.D)
+        self.final_gamma = np.ones(cfg.D)
+        self.output_matrix = self.rand(cfg.D, cfg.vocab_size)
+        self.decoder_layer_parms = [self.make_layer(cfg) for _ in range(cfg.num_layers)]
+
+    def rand(self, *shape):
+        return self.rng.normal(0, 0.02, shape)
+
+
+    def make_layer(self, cfg):
+        return (
+            np.ones(cfg.D),
+            np.ones(cfg.D),
+            cfg.eps,
+            self.rand(cfg.D, cfg.H_q * cfg.d_h),
+            self.rand(cfg.D, cfg.H_kv * cfg.d_h),
+            self.rand(cfg.D, cfg.H_kv * cfg.d_h),
+            self.rand(cfg.H_q * cfg.d_h, cfg.D),
+            cfg.d_h,
+            np.ones(cfg.d_h),
+            np.ones(cfg.d_h),
+            cfg.base,
+            self.rand(cfg.D, cfg.I),
+            self.rand(cfg.D, cfg.I),
+            self.rand(cfg.I, cfg.D),
+        )
+
+
+cfg = Qwen3Config()
+w = RandomQwen3Weights(cfg)
+model = Qwen3(w.num_layers, w.WE, w.final_gamma, w.eps, w.output_matrix, w.decoder_layer_parms)
+
+logits = model(np.array([[1, 2, 3, 4]])) 
+print(logits.shape) # (1, 4, 151936)
+
+
+def generate(model, ids, max_new_tokens=20, eos_id=None):
+    # ids: (N, P) prompt token ids
+    model.reset_cache()                              
+    logits = model(ids)
+    finished = np.zeros(ids.shape[0], dtype=bool)
+
+    for _ in range(max_new_tokens):
+        next_id = logits[:, -1, :].argmax(-1) # (N, )
+
+        # 1. Sequences that already finished: ignore the model's prediction
+        # and just output EOS again, as filler
+        if eos_id is not None:
+            N = next_id.shape[0]
+            for n in range(N):
+                if finished[n]:
+                    next_id[n] = eos_id
+
+        # 2. Sequences that just produced EOS: mark them as finished
+        for n in range(N):
+            if next_id[n] == eos_id:
+                finished[n] = True
+
+        ids = np.concatenate([ids, next_id[:, None]], axis=1) # (N, current_length + 1)
+
+        if eos_id is not None and finished.all():
+            break
+
+        logits = model(next_id[:, None]) # next_id.hape: (N,) # logit shape (N, 1, V)
+
+    return ids

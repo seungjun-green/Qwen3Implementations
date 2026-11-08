@@ -1,0 +1,42 @@
+
+import torch
+from transformers import AutoModelForCausalLM
+from Qwen3Config import Qwen3Config, Qwen3
+
+class RealQwen3Weights:
+    def __init__(self, cfg, model_name="Qwen/Qwen3-0.6B"):
+        hf = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32)
+        sd = {k: v.detach().numpy() for k, v in hf.state_dict().items()}
+        del hf # free the PyTorch copy
+
+        self.num_layers = cfg.num_layers
+        self.eps = cfg.eps
+        self.WE = sd["model.embed_tokens.weight"] # (V, D), no transpose
+        self.final_gamma = sd["model.norm.weight"] # (D,)
+        # tied in 0.6B; larger models have a separate lm_head, so use it when present
+        self.output_matrix = sd.get("lm_head.weight", self.WE).T    # (D, V)
+
+        self.decoder_layer_parms = [self.make_layer(sd, cfg, i) for i in range(cfg.num_layers)]
+
+    def make_layer(self, sd, cfg, i):
+        p = f"model.layers.{i}."
+        return (
+            sd[p + "input_layernorm.weight"], 
+            sd[p + "post_attention_layernorm.weight"],   
+            cfg.eps,
+            sd[p + "self_attn.q_proj.weight"].T,
+            sd[p + "self_attn.k_proj.weight"].T,
+            sd[p + "self_attn.v_proj.weight"].T,
+            sd[p + "self_attn.o_proj.weight"].T,
+            cfg.d_h,
+            sd[p + "self_attn.q_norm.weight"],
+            sd[p + "self_attn.k_norm.weight"],
+            cfg.base,
+            sd[p + "mlp.gate_proj.weight"].T,
+            sd[p + "mlp.up_proj.weight"].T,
+            sd[p + "mlp.down_proj.weight"].T,
+        )
+
+cfg = Qwen3Config()
+w = RealQwen3Weights(cfg)
+model = Qwen3(w.num_layers, w.WE, w.final_gamma, w.eps, w.output_matrix, w.decoder_layer_parms)

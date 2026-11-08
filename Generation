@@ -1,0 +1,113 @@
+import numpy as np
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+ 
+from qwen3 import Qwen3Config, Qwen3, generate
+from real_qwen3_weights import RealQwen3Weights
+ 
+MODEL_NAME = "Qwen/Qwen3-0.6B"
+MAX_NEW_TOKENS = 20
+ 
+prompts = [
+    "The capital of France is",
+    "def fibonacci(n):",
+    "Once upon a time",
+]
+
+
+ 
+cfg = Qwen3Config()
+tok = AutoTokenizer.from_pretrained(MODEL_NAME)
+ 
+w = RealQwen3Weights(cfg, MODEL_NAME)
+model = Qwen3(w.num_layers, w.WE, w.final_gamma, w.eps, w.output_matrix, w.decoder_layer_parms)
+ 
+hf = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float32)
+hf.eval()
+ 
+ 
+def encode(text):
+    return tok(text, return_tensors="np")["input_ids"] # (1, L)
+ 
+ 
+### Check 1: output shape
+print("=== Check 1: shape ===")
+ids = encode(prompts[0])
+model.reset_cache()
+logits = model(ids)
+expected = (1, ids.shape[1], cfg.vocab_size)
+print("input ids:", ids.shape, "| logits:", logits.shape, "| expected:", expected)
+assert logits.shape == expected, "shape mismatch!"
+print("shape OK\n")
+
+
+
+## Check 2: logits vs. official model (full sequence, no generation)
+print("=== Check 2: logits vs Hugging Face ===")
+for p in prompts:
+    ids = encode(p)
+ 
+    model.reset_cache()
+    mine = model(ids)                                             
+ 
+    with torch.no_grad():
+        ref = hf(torch.tensor(ids)).logits.numpy()
+ 
+    max_diff = np.abs(mine - ref).max()
+    same_argmax = (mine.argmax(-1) == ref.argmax(-1)).all()
+    print(f"{p!r:35} max abs diff = {max_diff:.2e} | same argmax: {same_argmax}")
+
+
+### Check 3: greedy generation (temperature 0) vs. official generate
+
+def generate(model, ids, max_new_tokens=20, eos_id=None):
+    # ids: (N, P) prompt token ids
+    model.reset_cache()                              
+    logits = model(ids)
+    finished = np.zeros(ids.shape[0], dtype=bool)
+
+    for _ in range(max_new_tokens):
+        next_id = logits[:, -1, :].argmax(-1) # (N, )
+
+        # 1. Sequences that already finished: ignore the model's prediction
+        # and just output EOS again, as filler
+        if eos_id is not None:
+            N = next_id.shape[0]
+            for n in range(N):
+                if finished[n]:
+                    next_id[n] = eos_id
+
+        # 2. Sequences that just produced EOS: mark them as finished
+        for n in range(N):
+            if next_id[n] == eos_id:
+                finished[n] = True
+
+        ids = np.concatenate([ids, next_id[:, None]], axis=1) # (N, current_length + 1)
+
+        if eos_id is not None and finished.all():
+            break
+
+        logits = model(next_id[:, None]) # next_id.hape: (N,) # logit shape (N, 1, V)
+
+    return ids
+
+
+
+print("=== Check 3: greedy generation vs Hugging Face ===")
+for p in prompts:
+    ids = encode(p)
+    P = ids.shape[1]
+ 
+    mine = generate(model, ids, max_new_tokens=MAX_NEW_TOKENS, eos_id=tok.eos_token_id)[0]
+ 
+    with torch.no_grad():
+        ref = hf.generate(torch.tensor(ids), max_new_tokens=MAX_NEW_TOKENS, do_sample=False)[0].numpy()
+ 
+    # compare the overlapping part (one side may stop early at EOS)
+    n = min(len(mine), len(ref))
+    identical = np.array_equal(mine[:n], ref[:n])
+ 
+    print("prompt:   ", repr(p))
+    print("mine:     ", repr(tok.decode(mine[P:])))
+    print("hf:       ", repr(tok.decode(ref[P:])))
+    print("identical:", identical, "\n")
